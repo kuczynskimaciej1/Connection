@@ -8,13 +8,24 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
+import android.location.Location;
+import android.location.LocationManager;
+import android.net.TrafficStats;
 import android.os.BatteryManager;
+import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.PowerManager;
+import android.telephony.CellIdentityNr;
 import android.telephony.CellInfo;
 import android.telephony.CellInfoLte;
 import android.telephony.CellInfoNr;
+import android.telephony.CellSignalStrengthLte;
 import android.telephony.CellSignalStrengthNr;
 import android.telephony.TelephonyCallback;
 import android.telephony.TelephonyDisplayInfo;
@@ -34,37 +45,77 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.text.SimpleDateFormat;
 import java.util.Date;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.Executor;
 
+/**
+ * NetworkCollectionService
+ * Główny serwis zbierający dane telemetryczne 5G/LTE, parametry środowiskowe
+ * oraz wykonujący wnioskowanie (Inference) modelu ML na urządzeniu (Edge AI).
+ */
 public class NetworkCollectionService extends Service {
 
+    // --- STAŁE ---
+    private static final String TAG = "NetworkService";
     private static final String CHANNEL_ID = "NetworkMonitorChannel";
     private static final int NOTIFICATION_ID = 1;
-    private static final String TAG = "NetworkService";
+    private static final long POLL_INTERVAL_MS = 1000; // Częstotliwość próbkowania (1s)
+    private static final int AI_WINDOW_SIZE = 10;      // Rozmiar okna przesuwnego dla modelu
+    private static final float AI_ANOMALY_THRESHOLD = 0.15f;
 
+    // --- KOMPONENTY SYSTEMOWE ---
     private TelephonyManager telephonyManager;
+    private LocationManager locationManager;
+    private SensorManager sensorManager;
+    private PowerManager.WakeLock wakeLock;
     private TelephonyCallback telephonyCallback;
+
+    // --- WĄTKI I HANDLERY ---
     private HandlerThread workerThread;
     private Handler workerHandler;
+    private Runnable pollerTask;
+
+    // --- ZMIENNE STANU ---
     private FileOutputStream fileOutputStream;
     private boolean isLogging = false;
-
-    // Zmienna przechowująca aktualny "wyświetlany" typ sieci (do detekcji 5G NSA)
     private int currentDisplayNetworkType = TelephonyManager.NETWORK_TYPE_UNKNOWN;
+
+    // --- SENSORY I METRYKI ---
+    private float currentLightLux = -1.0f;
+    private long lastRxBytes = 0;
+    private long lastTxBytes = 0;
+    private long lastTrafficTime = 0;
+
+    // --- MODUŁ AI ---
+    private AnomalyDetector anomalyDetector;
+    private final LinkedList<float[]> dataWindow = new LinkedList<>();
+
+    // --- NASŁUCHIWANIE SENSORÓW ---
+    private final SensorEventListener lightListener = new SensorEventListener() {
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+            currentLightLux = event.values[0];
+        }
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) { }
+    };
+
+    // ============================================================================================
+    // CYKL ŻYCIA SERWISU
+    // ============================================================================================
 
     @Override
     public void onCreate() {
         super.onCreate();
-        createNotificationChannel();
+        Log.d(TAG, "Inicjalizacja serwisu...");
 
-        // 1. Uruchomienie wątku tła (nie obciąża UI)
-        workerThread = new HandlerThread("NetworkCollectorWorker");
-        workerThread.start();
-        workerHandler = new Handler(workerThread.getLooper());
-
-        telephonyManager = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
+        setupNotificationChannel();
+        setupPowerManagement();
+        setupThreads();
+        setupSystemServices();
+        setupAiModule();
         setupLogFile();
     }
 
@@ -75,229 +126,397 @@ public class NetworkCollectionService extends Service {
             return START_NOT_STICKY;
         }
 
-        // 2. Start Foreground Service (wymagane, by system nie ubił procesu)
         startForeground(NOTIFICATION_ID, buildNotification());
 
         if (!isLogging) {
             registerCallbacks();
+            startActivePolling();
             isLogging = true;
         }
 
         return START_STICKY;
     }
 
-    private void registerCallbacks() {
-        // 1. Sprawdzenie uprawnień
-        if (ActivityCompat.checkSelfPermission(this, android.Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) {
-            Log.e(TAG, "Brak uprawnień do rejestracji callbacka!");
-            // Opcjonalnie: zatrzymaj serwis, jeśli brak uprawnień krytycznych
-            // stopSelf();
-            return;
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+        Log.d(TAG, "Zatrzymywanie serwisu...");
+
+        // Zwolnienie zasobów w odwrotnej kolejności
+        if (workerHandler != null && pollerTask != null) workerHandler.removeCallbacks(pollerTask);
+        if (sensorManager != null) sensorManager.unregisterListener(lightListener);
+        if (telephonyCallback != null) telephonyManager.unregisterTelephonyCallback(telephonyCallback);
+        if (anomalyDetector != null) anomalyDetector.close();
+        if (workerThread != null) workerThread.quitSafely();
+
+        if (wakeLock != null && wakeLock.isHeld()) {
+            wakeLock.release();
+            Log.d(TAG, "WakeLock zwolniony.");
         }
-
-        // 2. Inicjalizacja Callbacka (ubezpieczenie przed nullem)
-        if (telephonyCallback == null) {
-            telephonyCallback = new MyTelephonyCallback();
-        }
-
-        // 3. Utworzenie Executora (Naprawa błędu "getThreadExecutor")
-        // Executor to "pośrednik", który przekaże zadania do naszego workerHandlera (wątku tła)
-        Executor serviceExecutor = new Executor() {
-            @Override
-            public void execute(Runnable command) {
-                if (workerHandler != null) {
-                    workerHandler.post(command);
-                } else {
-                    Log.e(TAG, "Błąd: workerHandler jest null!");
-                }
-            }
-        };
-
-        // 4. Rejestracja w systemie
-        try {
-            // Tutaj następuje kluczowe wywołanie - oba argumenty są teraz na pewno zainicjalizowane
-            telephonyManager.registerTelephonyCallback(serviceExecutor, telephonyCallback);
-            Log.d(TAG, "TelephonyCallback zarejestrowany pomyślnie.");
-        } catch (Exception e) {
-            Log.e(TAG, "Krytyczny błąd podczas rejestracji callbacka: ", e);
-        }
-    }
-
-    // Nowoczesna implementacja Callbacków
-    private class MyTelephonyCallback extends TelephonyCallback implements
-            TelephonyCallback.ServiceStateListener,
-            TelephonyCallback.SignalStrengthsListener,
-            TelephonyCallback.DisplayInfoListener { // Kluczowe dla 5G NSA
-
-        @Override
-        public void onServiceStateChanged(@NonNull android.telephony.ServiceState serviceState) {
-            workerHandler.post(() -> collectAndSaveData("ServiceState"));
-        }
-
-        @Override
-        public void onSignalStrengthsChanged(@NonNull android.telephony.SignalStrength signalStrength) {
-            workerHandler.post(() -> collectAndSaveData("SignalStrength"));
-        }
-
-        @Override
-        public void onDisplayInfoChanged(@NonNull TelephonyDisplayInfo displayInfo) {
-            // Tutaj wykrywamy, czy LTE to tak naprawdę 5G NSA
-            currentDisplayNetworkType = displayInfo.getOverrideNetworkType();
-            workerHandler.post(() -> collectAndSaveData("DisplayInfo"));
-        }
-    }
-
-    private void collectAndSaveData(String trigger) {
-        if (ActivityCompat.checkSelfPermission(this, android.Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) return;
 
         try {
-            JSONObject json = new JSONObject();
-
-            // A. TIMESTAMP DLA ML (Unix Epoch - łatwiejsze do synchronizacji)
-            long now = System.currentTimeMillis();
-            json.put("timestamp_epoch", now);
-            json.put("timestamp_human", new SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(new Date(now)));
-            json.put("trigger", trigger);
-
-            // B. POPRAWNA DETEKCJA SIECI (5G NSA vs LTE)
-            int rawNetworkType = telephonyManager.getDataNetworkType();
-            String refinedNetworkType = getRefinedNetworkType(rawNetworkType, currentDisplayNetworkType);
-            json.put("network_type_raw", rawNetworkType);
-            json.put("network_type_refined", refinedNetworkType);
-            json.put("is_5g_nsa", currentDisplayNetworkType == TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NR_NSA);
-
-            // C. MONITOROWANIE BATERII (Dla optymalizacji Green AI)
-            BatteryManager bm = (BatteryManager) getSystemService(BATTERY_SERVICE);
-            int batteryLevel = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY);
-            // Temperatura w stopniach Celsjusza (niektóre telefony zwracają int * 10)
-            // Uwaga: Dokładne API temperatury zależy od producenta, tu używamy standardowego Intenta
-            Intent batteryIntent = registerReceiver(null, new android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED));
-            assert batteryIntent != null;
-            int tempRaw = batteryIntent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1);
-            float tempC = tempRaw / 10.0f;
-
-            json.put("battery_level", batteryLevel);
-            json.put("battery_temp_c", tempC);
-            json.put("is_charging", bm.isCharging());
-
-            // D. SYGNAŁ (Z obsługą błędnych wartości i pętlą po wszystkich technologiach)
-            if (ActivityCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-                List<CellInfo> cellInfoList = telephonyManager.getAllCellInfo();
-                if (cellInfoList != null) {
-                    org.json.JSONArray cellsArray = new org.json.JSONArray();
-
-                    for (CellInfo cell : cellInfoList) {
-                        JSONObject cellData = new JSONObject();
-                        cellData.put("is_registered", cell.isRegistered());
-                        // Zapisujemy timestamp dla każdej komórki, ułatwi to parsowanie pojedynczych linii w Pythonie
-                        cellData.put("timestamp", now);
-
-                        if (cell instanceof CellInfoNr) {
-                            CellInfoNr nr = (CellInfoNr) cell;
-                            CellSignalStrengthNr signal = (CellSignalStrengthNr) nr.getCellSignalStrength();
-
-                            cellData.put("type", "5G_NR");
-                            // Identyfikacja
-                            if (nr.getCellIdentity() instanceof android.telephony.CellIdentityNr) {
-                                android.telephony.CellIdentityNr id = (android.telephony.CellIdentityNr) nr.getCellIdentity();
-                                putCleanInt(cellData, "pci", id.getPci());
-                                putCleanInt(cellData, "tac", id.getTac());
-                                putCleanInt(cellData, "nci", (int) id.getNci()); // Cast long to int safe here for JSON
-                            }
-
-                            // Sygnał (SS - Synchronization Signal)
-                            putCleanInt(cellData, "ss_rsrp", signal.getSsRsrp());
-                            putCleanInt(cellData, "ss_rsrq", signal.getSsRsrq());
-                            putCleanInt(cellData, "ss_sinr", signal.getSsSinr());
-
-                            // CSI (Channel State Information) - ważne dla jakości pasma
-                            putCleanInt(cellData, "csi_rsrp", signal.getCsiRsrp());
-                            putCleanInt(cellData, "csi_rsrq", signal.getCsiRsrq());
-                            putCleanInt(cellData, "csi_sinr", signal.getCsiSinr());
-
-                        } else if (cell instanceof CellInfoLte) {
-                            CellInfoLte lte = (CellInfoLte) cell;
-                            android.telephony.CellSignalStrengthLte signal = lte.getCellSignalStrength();
-
-                            cellData.put("type", "LTE");
-                            putCleanInt(cellData, "pci", lte.getCellIdentity().getPci());
-                            putCleanInt(cellData, "ci", lte.getCellIdentity().getCi());
-                            putCleanInt(cellData, "earfcn", lte.getCellIdentity().getEarfcn());
-
-                            putCleanInt(cellData, "rsrp", signal.getRsrp());
-                            putCleanInt(cellData, "rsrq", signal.getRsrq());
-                            putCleanInt(cellData, "rssnr", signal.getRssnr());
-                            putCleanInt(cellData, "cqi", signal.getCqi());
-                            putCleanInt(cellData, "timing_advance", signal.getTimingAdvance());
-
-
-                        } else if (cell instanceof android.telephony.CellInfoGsm) {
-                            android.telephony.CellInfoGsm gsm = (android.telephony.CellInfoGsm) cell;
-                            android.telephony.CellSignalStrengthGsm signal = gsm.getCellSignalStrength();
-
-                            cellData.put("type", "GSM");
-                            putCleanInt(cellData, "cid", gsm.getCellIdentity().getCid());
-                            putCleanInt(cellData, "lac", gsm.getCellIdentity().getLac());
-                            putCleanInt(cellData, "dbm", signal.getDbm());
-                            putCleanInt(cellData, "ber", signal.getBitErrorRate()); // Bit Error Rate - ważne dla anomalii!
-
-                        } else if (cell instanceof android.telephony.CellInfoWcdma) {
-                            android.telephony.CellInfoWcdma wcdma = (android.telephony.CellInfoWcdma) cell;
-                            android.telephony.CellSignalStrengthWcdma signal = wcdma.getCellSignalStrength();
-
-                            cellData.put("type", "WCDMA");
-                            putCleanInt(cellData, "cid", wcdma.getCellIdentity().getCid());
-                            putCleanInt(cellData, "lac", wcdma.getCellIdentity().getLac());
-                            putCleanInt(cellData, "dbm", signal.getDbm());
-                            putCleanInt(cellData, "ecno", signal.getEcNo());
-                        }
-
-                        // Dodajemy komórkę do listy, tylko jeśli udało się zebrać jakieś dane (np. typ nie jest pusty)
-                        if (cellData.has("type")) {
-                            cellsArray.put(cellData);
-                        }
-                    }
-                    // Dodajemy całą tablicę komórek do głównego obiektu JSON
-                    json.put("cells", cellsArray);
-                }
-            }
-
-            // Zapis do pliku (Format JSON Lines - jedna linia = jeden rekord)
-            String logLine = json.toString() + "\n";
-            if (fileOutputStream != null) {
-                fileOutputStream.write(logLine.getBytes());
-            }
-
-        } catch (Exception e) {
-            Log.e(TAG, "Error collecting data", e);
+            if (fileOutputStream != null) fileOutputStream.close();
+        } catch (IOException e) {
+            e.printStackTrace();
         }
     }
 
-    // Logika rozpoznawania 5G NSA
-    private String getRefinedNetworkType(int rawType, int overrideType) {
-        if (rawType == TelephonyManager.NETWORK_TYPE_LTE) {
-            if (overrideType == TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NR_NSA) {
-                return "5G_NSA"; // To jest to, co widziałeś jako LTE!
-            }
-            if (overrideType == TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NR_ADVANCED) {
-                return "5G_MMWAVE_OR_ADVANCED";
+    @Nullable
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
+
+    // ============================================================================================
+    // KONFIGURACJA (SETUP)
+    // ============================================================================================
+
+    private void setupNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                    CHANNEL_ID,
+                    "Network Monitor Channel",
+                    NotificationManager.IMPORTANCE_LOW
+            );
+            getSystemService(NotificationManager.class).createNotificationChannel(channel);
+        }
+    }
+
+    private void setupPowerManagement() {
+        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "NetworkCollectionService::Wakelock");
+        wakeLock.acquire(); // Utrzymuj CPU włączone
+    }
+
+    private void setupThreads() {
+        workerThread = new HandlerThread("NetworkCollectorWorker");
+        workerThread.start();
+        workerHandler = new Handler(workerThread.getLooper());
+    }
+
+    private void setupSystemServices() {
+        telephonyManager = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
+        locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+        sensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
+
+        // Konfiguracja sensora światła
+        if (sensorManager != null) {
+            Sensor lightSensor = sensorManager.getDefaultSensor(Sensor.TYPE_LIGHT);
+            if (lightSensor != null) {
+                sensorManager.registerListener(lightListener, lightSensor, SensorManager.SENSOR_DELAY_NORMAL);
             }
         }
-        if (rawType == TelephonyManager.NETWORK_TYPE_NR) {
-            return "5G_SA"; // Standalone
+
+        // Inicjalizacja statystyk ruchu
+        lastRxBytes = TrafficStats.getMobileRxBytes();
+        lastTxBytes = TrafficStats.getMobileTxBytes();
+        lastTrafficTime = System.currentTimeMillis();
+    }
+
+    private void setupAiModule() {
+        try {
+            anomalyDetector = new AnomalyDetector(this);
+            Log.d(TAG, "AI: Model załadowany pomyślnie.");
+        } catch (IOException e) {
+            Log.e(TAG, "AI: Błąd ładowania modelu TFLite!", e);
         }
-        return "OTHER";
     }
 
     private void setupLogFile() {
         try {
             File dir = getExternalFilesDir(null);
             String filename = "data_ml_ready_" + System.currentTimeMillis() + ".jsonl";
-            File file = new File(dir, filename);
-            fileOutputStream = new FileOutputStream(file, true);
+            fileOutputStream = new FileOutputStream(new File(dir, filename), true);
         } catch (IOException e) {
-            e.printStackTrace();
+            Log.e(TAG, "Błąd tworzenia pliku logów", e);
         }
+    }
+
+    // ============================================================================================
+    // LOGIKA ZBIERANIA DANYCH (POLLING)
+    // ============================================================================================
+
+    private void registerCallbacks() {
+        if (!hasPermissions()) return;
+
+        telephonyCallback = new MyTelephonyCallback();
+        // Executor delegujący do wątku roboczego
+        Executor serviceExecutor = command -> {
+            if (workerHandler != null) workerHandler.post(command);
+        };
+        telephonyManager.registerTelephonyCallback(serviceExecutor, telephonyCallback);
+    }
+
+    private void startActivePolling() {
+        pollerTask = new Runnable() {
+            @Override
+            public void run() {
+                forceModemUpdate();
+                if (workerHandler != null) {
+                    workerHandler.postDelayed(this, POLL_INTERVAL_MS);
+                }
+            }
+        };
+        workerHandler.post(pollerTask);
+    }
+
+    private void forceModemUpdate() {
+        // Sprawdzenie bezpieczeństwa - bez uprawnień kończymy działanie tej metody
+        if (ActivityCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            Log.w(TAG, "Brak uprawnień lokalizacyjnych - pomijam Active Poll");
+            return;
+        }
+
+        // Dla Androida 10+ (Q) wymuszamy odświeżenie
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            Executor executor = command -> {
+                if (workerHandler != null) workerHandler.post(command);
+            };
+
+            try {
+                telephonyManager.requestCellInfoUpdate(executor, new TelephonyManager.CellInfoCallback() {
+                    @Override
+                    public void onCellInfo(@NonNull List<CellInfo> cellInfo) {
+                        processAndSaveData(cellInfo, "ActivePoll");
+                    }
+
+                    @Override
+                    public void onError(int errorCode, @Nullable Throwable detail) {
+                        Log.w(TAG, "Błąd modemu (ActivePoll code): " + errorCode);
+                    }
+                });
+            } catch (Exception e) {
+                Log.e(TAG, "Wyjątek przy requestCellInfoUpdate", e);
+            }
+        } else {
+            // Dla starszych Androidów bierzemy dane z cache
+            processAndSaveData(telephonyManager.getAllCellInfo(), "LegacyPoll");
+        }
+    }
+
+    // ============================================================================================
+    // PRZETWARZANIE I ZAPIS DANYCH
+    // ============================================================================================
+
+    private void processAndSaveData(List<CellInfo> cellInfoList, String trigger) {
+        if (!hasPermissions()) return;
+
+        try {
+            JSONObject json = new JSONObject();
+            long now = System.currentTimeMillis();
+
+            // 1. Metadane podstawowe
+            json.put("timestamp_epoch", now);
+            json.put("timestamp_human", new SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(new Date(now)));
+            json.put("trigger", trigger);
+
+            // 2. Zbieranie danych telemetrycznych (Bateria, GPS, Ruch, Światło)
+            gatherTelemetry(json);
+
+            // 3. Przetwarzanie komórek i logika AI
+            if (cellInfoList != null) {
+                processCells(cellInfoList, json, now);
+            }
+
+            // 4. Zapis do pliku
+            writeToJsonFile(json);
+
+        } catch (Exception e) {
+            Log.e(TAG, "Błąd w pętli przetwarzania danych", e);
+        }
+    }
+    @android.annotation.SuppressLint("MissingPermission")
+    private void gatherTelemetry(JSONObject json) throws JSONException {
+        // Bateria
+        BatteryManager bm = (BatteryManager) getSystemService(BATTERY_SERVICE);
+        if (bm != null) {
+            json.put("battery_level", bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY));
+        }
+
+        // Stan sieci (Teraz kod jest czysty)
+        json.put("network_type_raw", telephonyManager.getDataNetworkType());
+        json.put("network_type_refined", getRefinedNetworkType(telephonyManager.getDataNetworkType(), currentDisplayNetworkType));
+        json.put("is_5g_nsa", currentDisplayNetworkType == TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NR_NSA);
+
+        // Światło (Lux)
+        json.put("light_lux", currentLightLux);
+
+        // GPS (Prędkość) - tu zostawiamy IF, bo to osobne uprawnienie lokalizacyjne
+        if (ActivityCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+            Location loc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+            if (loc == null) loc = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+
+            if (loc != null) {
+                json.put("speed_kmh", loc.getSpeed() * 3.6);
+                json.put("gps_lat", loc.getLatitude());
+                json.put("gps_lng", loc.getLongitude());
+            } else {
+                json.put("speed_kmh", 0.0);
+            }
+        }
+
+        // Ruch sieciowy
+        long currentRx = TrafficStats.getMobileRxBytes();
+        long currentTx = TrafficStats.getMobileTxBytes();
+
+        if (currentRx == TrafficStats.UNSUPPORTED) currentRx = 0;
+        if (currentTx == TrafficStats.UNSUPPORTED) currentTx = 0;
+
+        // Obliczamy deltę tylko jeśli to nie jest pierwszy pomiar
+        long deltaRx = 0;
+        long deltaTx = 0;
+        if (lastRxBytes > 0 && currentRx >= lastRxBytes) {
+            deltaRx = currentRx - lastRxBytes;
+        }
+        if (lastTxBytes > 0 && currentTx >= lastTxBytes) {
+            deltaTx = currentTx - lastTxBytes;
+        }
+
+        json.put("traffic_rx_bytes", deltaRx);
+        json.put("traffic_tx_bytes", deltaTx);
+
+        lastRxBytes = currentRx;
+        lastTxBytes = currentTx;
+    }
+
+    private void processCells(List<CellInfo> cellInfoList, JSONObject json, long now) throws JSONException {
+        org.json.JSONArray cellsArray = new org.json.JSONArray();
+
+        for (CellInfo cell : cellInfoList) {
+            JSONObject cellData = new JSONObject();
+            cellData.put("is_registered", cell.isRegistered());
+            cellData.put("timestamp", now);
+
+            // Zmienne pomocnicze dla AI
+            float aiRsrp = -140.0f;
+            float aiRsrq = -20.0f;
+            float aiSinr = -10.0f;
+            boolean readyForAi = false;
+
+            // --- LOGIKA 5G NR ---
+            if (cell instanceof CellInfoNr) {
+                CellInfoNr nr = (CellInfoNr) cell;
+                CellSignalStrengthNr signal = (CellSignalStrengthNr) nr.getCellSignalStrength();
+                cellData.put("type", "5G_NR");
+
+                if (nr.getCellIdentity() instanceof CellIdentityNr) {
+                    CellIdentityNr id = (CellIdentityNr) nr.getCellIdentity();
+                    putSafe(cellData, "pci", id.getPci());
+                    putSafe(cellData, "nci", (int) id.getNci());
+                }
+                putSafe(cellData, "rsrp", signal.getSsRsrp());
+                putSafe(cellData, "rsrq", signal.getSsRsrq());
+                putSafe(cellData, "sinr", signal.getSsSinr());
+
+                if (cell.isRegistered() && isValid(signal.getSsRsrp())) {
+                    aiRsrp = signal.getSsRsrp();
+                    aiRsrq = signal.getSsRsrq();
+                    aiSinr = isValid(signal.getSsSinr()) ? signal.getSsSinr() : -10.0f;
+                    readyForAi = true;
+                }
+            }
+            // --- LOGIKA LTE ---
+            else if (cell instanceof CellInfoLte) {
+                CellInfoLte lte = (CellInfoLte) cell;
+                CellSignalStrengthLte signal = lte.getCellSignalStrength();
+                cellData.put("type", "LTE");
+
+                putSafe(cellData, "pci", lte.getCellIdentity().getPci());
+                putSafe(cellData, "earfcn", lte.getCellIdentity().getEarfcn());
+                putSafe(cellData, "rsrp", signal.getRsrp());
+                putSafe(cellData, "rsrq", signal.getRsrq());
+                putSafe(cellData, "rssnr", signal.getRssnr());
+                putSafe(cellData, "cqi", signal.getCqi());
+                putSafe(cellData, "timing_advance", signal.getTimingAdvance());
+
+                // LTE jako kotwica dla NSA - używamy do AI
+                if (cell.isRegistered() && isValid(signal.getRsrp())) {
+                    aiRsrp = signal.getRsrp();
+                    aiRsrq = signal.getRsrq();
+                    aiSinr = isValid(signal.getRssnr()) ? signal.getRssnr() : 0.0f;
+                    readyForAi = true;
+                }
+            }
+
+            // --- WNIOSKOWANIE AI (EDGE INFERENCE) ---
+            if (readyForAi && anomalyDetector != null) {
+                runAiAnalysis(cellData, aiRsrp, aiRsrq, aiSinr);
+            }
+
+            if (cellData.has("type")) {
+                cellsArray.put(cellData);
+            }
+        }
+        json.put("cells", cellsArray);
+    }
+
+    private void runAiAnalysis(JSONObject cellData, float rsrp, float rsrq, float sinr) throws JSONException {
+        float[] features = new float[]{rsrp, rsrq, sinr};
+
+        synchronized (dataWindow) {
+            dataWindow.add(features);
+            if (dataWindow.size() > AI_WINDOW_SIZE) {
+                dataWindow.removeFirst();
+            }
+
+            if (dataWindow.size() == AI_WINDOW_SIZE) {
+                // Konwersja listy na macierz [10][3]
+                float[][] windowArray = new float[AI_WINDOW_SIZE][3];
+                for (int i = 0; i < AI_WINDOW_SIZE; i++) {
+                    windowArray[i] = dataWindow.get(i);
+                }
+
+                // Wykonanie predykcji
+                float anomalyScore = anomalyDetector.analyze(windowArray);
+
+                cellData.put("ai_anomaly_score", anomalyScore);
+                boolean isAnomaly = anomalyScore > AI_ANOMALY_THRESHOLD;
+                cellData.put("ai_status", isAnomaly ? "ANOMALY" : "NORMAL");
+
+                if (isAnomaly) {
+                    Log.w(TAG, "!!! WYKRYTO ANOMALIĘ !!! Score: " + anomalyScore);
+                }
+            } else {
+                cellData.put("ai_status", "BUFFERING");
+            }
+        }
+    }
+
+    // ============================================================================================
+    // METODY POMOCNICZE (UTILS)
+    // ============================================================================================
+
+    private void writeToJsonFile(JSONObject json) throws IOException {
+        if (fileOutputStream != null) {
+            fileOutputStream.write((json.toString() + "\n").getBytes());
+            // fileOutputStream.flush(); // Można odkomentować dla debugowania, ale częsty flush zużywa I/O
+        }
+    }
+
+    private boolean hasPermissions() {
+        return ActivityCompat.checkSelfPermission(this, android.Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED &&
+                ActivityCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void putSafe(JSONObject json, String key, int value) throws JSONException {
+        if (value == Integer.MAX_VALUE || value == 2147483647) {
+            json.put(key, JSONObject.NULL);
+        } else {
+            json.put(key, value);
+        }
+    }
+
+    private boolean isValid(int value) {
+        return value != Integer.MAX_VALUE && value != 2147483647;
+    }
+
+    private String getRefinedNetworkType(int rawType, int overrideType) {
+        if (rawType == TelephonyManager.NETWORK_TYPE_LTE) {
+            if (overrideType == TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NR_NSA) return "5G_NSA";
+            if (overrideType == TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NR_ADVANCED) return "5G_MMWAVE";
+        }
+        if (rawType == TelephonyManager.NETWORK_TYPE_NR) return "5G_SA";
+        return "OTHER";
     }
 
     private Notification buildNotification() {
@@ -306,54 +525,19 @@ public class NetworkCollectionService extends Service {
         PendingIntent stopPendingIntent = PendingIntent.getService(this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE);
 
         return new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("Zbieranie danych 5G")
-                .setContentText("Monitorowanie parametrów radiowych i baterii...")
+                .setContentTitle("Monitoring 5G/AI")
+                .setContentText("Zbieranie danych i analiza anomalii w tle...")
                 .setSmallIcon(android.R.drawable.ic_menu_info_details)
                 .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Zatrzymaj", stopPendingIntent)
                 .build();
     }
 
-    private void createNotificationChannel() {
-        NotificationChannel serviceChannel = new NotificationChannel(
-                CHANNEL_ID,
-                "Network Monitor Channel",
-                NotificationManager.IMPORTANCE_LOW
-        );
-        NotificationManager manager = getSystemService(NotificationManager.class);
-        manager.createNotificationChannel(serviceChannel);
-    }
-
-    @Override
-    public void onDestroy() {
-        super.onDestroy();
-        try {
-            if (telephonyCallback != null) telephonyManager.unregisterTelephonyCallback(telephonyCallback);
-            if (workerThread != null) workerThread.quitSafely();
-            if (fileOutputStream != null) fileOutputStream.close();
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-    }
-
-
-
-    @Nullable
-    @Override
-    public IBinder onBind(Intent intent) {
-        return null;
-    }
-
-    // Metoda pomocnicza do czyszczenia danych pod ML
-    // Jeśli wartość to Integer.MAX_VALUE (brak danych w Android API), wstawiamy NULL
-    private void putCleanInt(JSONObject json, String key, int value) {
-        try {
-            if (value == Integer.MAX_VALUE || value == 2147483647) {
-                json.put(key, JSONObject.NULL);
-            } else {
-                json.put(key, value);
-            }
-        } catch (JSONException e) {
-            e.printStackTrace();
+    // Klasa wewnętrzna do Callbacków (wymagana przez API)
+    private class MyTelephonyCallback extends TelephonyCallback implements
+            TelephonyCallback.DisplayInfoListener {
+        @Override
+        public void onDisplayInfoChanged(@NonNull TelephonyDisplayInfo displayInfo) {
+            currentDisplayNetworkType = displayInfo.getOverrideNetworkType();
         }
     }
 }
